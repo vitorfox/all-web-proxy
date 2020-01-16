@@ -89,11 +89,31 @@ func PostProto(ctx *fasthttp.RequestCtx) {
 	in := Message{}
 	out := Reply{}
 
-	err = conn.Invoke(context.Background(), method, &in, &out)
+	err = conn.Invoke(ctx, method, &in, &out)
+
+	desc := &grpc.StreamDesc{}
+
+	stream, err := conn.NewStream(context.Background(), desc, method)
 
 	if err != nil {
 		fmt.Println(err)
 	}
+
+	err = stream.SendMsg(&in)
+
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	err = stream.RecvMsg(&out)
+
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	meta := stream.Trailer()
+
+	fmt.Println(meta)
 
 	fmt.Println(string(out.Data))
 
