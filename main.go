@@ -3,24 +3,24 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
-	"github.com/golang/protobuf/proto"
+	"gopkg.in/yaml.v2"
+	"io/ioutil"
+
 	"google.golang.org/grpc/metadata"
 	"log"
 
-	"github.com/buaazp/fasthttprouter"
+	internalConfig "github.com/vitorfox/all-web-proxy/internal/config"
+	internalProto "github.com/vitorfox/all-web-proxy/internal/proto"
+
 	"github.com/valyala/fasthttp"
 	"google.golang.org/grpc"
 )
 
 var (
-	connDatasource *grpc.ClientConn
-	connDataloader *grpc.ClientConn
 	maxRecvSize = 1024 * 1024 * 1024
+	grpcUpstreamConnections = make(map[string]*grpc.ClientConn)
+	config internalConfig.All
 )
-
-func Index(ctx *fasthttp.RequestCtx) {
-	fmt.Println(ctx, "Welcome!\n")
-}
 
 type GrpcWebData struct {
 	Header, Body []byte
@@ -28,58 +28,6 @@ type GrpcWebData struct {
 
 func NewGrpcWebData(in []byte) *GrpcWebData {
 	return &GrpcWebData{in[:5], in[5:]}
-}
-
-type Message struct {
-	Data []byte
-}
-
-type Reply struct {
-	Data []byte
-}
-
-func (m Reply) Reset() {
-	m = Reply{}
-}
-
-func (m Reply) ProtoMessage() {}
-
-func (m Reply) String() string {
-	return fmt.Sprintln(m.Data)
-}
-
-func (m *Reply) XXX_Unmarshal(b []byte) error {
-	m.Data = b
-	return nil
-}
-
-func (m *Message) Reset()         {
-	*m = Message{}
-}
-func (m *Message) String() string {
-	return proto.CompactTextString(m)
-}
-func (*Message) ProtoMessage()    {}
-func (*Message) Descriptor() ([]byte, []int) {
-	return []byte{0}, []int{0}
-}
-
-func (m *Message) XXX_Unmarshal(b []byte) error {
-	m.Data = b
-	return nil
-}
-func (m *Message) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
-	return m.Data, nil
-}
-func (m *Message) XXX_Merge(src proto.Message) {
-	//xxx_messageInfo_DataloaderMeta.Merge(m, src)
-	fmt.Println(src)
-}
-func (m *Message) XXX_Size() int {
-	return len(m.Data)
-}
-func (m *Message) XXX_DiscardUnknown() {
-	fmt.Println(m)
 }
 
 func WithHeader(in []byte) []byte{
@@ -95,10 +43,24 @@ func WithHeaderStatus(in []byte) []byte{
 	return append([]byte{128,0,0,0,uint8(len(in))}, in...)
 }
 
+func ProtoHandler(ctx *fasthttp.RequestCtx, upstream *internalConfig.Upstream) {
+
+	m := string(ctx.Method())
+
+	fmt.Println("ProtoHandler method", m)
+	switch m {
+	case "OPTIONS":
+		OptionsProto(ctx)
+	case "POST":
+		if conn, ok := grpcUpstreamConnections[upstream.Name]; ok {
+			PostProto(ctx, conn)
+		}
+	}
+}
+
 func OptionsProto(ctx *fasthttp.RequestCtx) {
 
-	method := fmt.Sprintf("/proto.%s/%s", ctx.UserValue("service"), ctx.UserValue("method"))
-
+	method := string(ctx.Path())
 	log.Println(string(ctx.Method()), method)
 
 	ctx.Response.Header.Set("Access-Control-Allow-Origin","*")
@@ -110,28 +72,17 @@ func OptionsProto(ctx *fasthttp.RequestCtx) {
 	ctx.Response.SetStatusCode(204)
 }
 
-func PostProto(ctx *fasthttp.RequestCtx) {
+func PostProto(ctx *fasthttp.RequestCtx, conn *grpc.ClientConn) {
 
-	method := fmt.Sprintf("/proto.%s/%s", ctx.UserValue("service"), ctx.UserValue("method"))
 	grpcWebData := NewGrpcWebData(ctx.PostBody())
-
+	method := string(ctx.Path())
 	log.Println(string(ctx.Method()), method)
 	log.Println(grpcWebData)
 
-	conn := &grpc.ClientConn{}
-	switch ctx.UserValue("service") {
-	case "DatasourceService":
-		conn = connDatasource
-	case "Dataloader":
-		conn = connDataloader
-	default:
-		return
-	}
-
 	var header, trailer metadata.MD // variable to store header and trailer
 
-	in := Message{grpcWebData.Body}
-	out := Reply{}
+	in := internalProto.Message{grpcWebData.Body}
+	out := internalProto.Message{}
 
 	err := conn.Invoke(ctx, method, &in, &out,
 		grpc.Header(&header),
@@ -148,7 +99,6 @@ func PostProto(ctx *fasthttp.RequestCtx) {
 
 	fmt.Println(header)
 	fmt.Println(trailer)
-	fmt.Println(out.Data)
 
 	ctx.Response.Header.Reset()
 	ctx.Response.Header.Del("Content-Length")
@@ -162,28 +112,100 @@ func PostProto(ctx *fasthttp.RequestCtx) {
 
 }
 
+func GenericHttp(ctx *fasthttp.RequestCtx, upstream *internalConfig.Upstream) {
+
+	resp := fasthttp.AcquireResponse()
+	method := string(ctx.Path())
+
+	log.Println(string(ctx.Method()), method)
+
+	req := ctx.Request
+
+	req.SetHost(upstream.Address)
+
+	err := fasthttp.Do(&req, resp)
+
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	ctx.Response.SetBody(resp.Body())
+}
+
+func setupUpstreams(config internalConfig.All) {
+	for _, up := range config.Upstream {
+		if up.Type == internalConfig.UPSTREAM_GRPC {
+			conn, err := grpc.Dial(up.Address, grpc.WithInsecure())
+			if err != nil {
+				log.Println(err)
+				continue
+			}
+			grpcUpstreamConnections[up.Name] = conn
+		}
+	}
+}
+
+func handlerWithListener(listener *internalConfig.Listener) func (ctx *fasthttp.RequestCtx) {
+
+	funcc := func (ctx *fasthttp.RequestCtx) {
+		var route *internalConfig.Route
+
+		for _, vh := range listener.Virtualhosts {
+			if route != nil {
+				break
+			}
+			for _, vhr := range vh.Routes {
+				fmt.Println(vhr)
+				if vhr.Match.CompiletedRegex != nil {
+					if vhr.Match.CompiletedRegex.Match(ctx.Path()) {
+						route = &vhr
+						break
+					}
+				}
+			}
+		}
+
+		if route != nil {
+			for _, up := range config.Upstream {
+				if up.Name == route.Upstream {
+					if up.Type == internalConfig.UPSTREAM_GRPC {
+						ProtoHandler(ctx, &up)
+					}
+					if up.Type == internalConfig.UPSTREAM_HTTP {
+						GenericHttp(ctx, &up)
+					}
+					break
+				}
+			}
+		}
+	}
+
+	return funcc
+}
+
 func main() {
 
-	conn, err := grpc.Dial("localhost:50051", grpc.WithInsecure())
+	data, err := ioutil.ReadFile("config.yaml")
 
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	connDatasource = conn
+	tmpConfig := internalConfig.All{}
 
-	conn, err = grpc.Dial("localhost:50055", grpc.WithInsecure())
+	err = yaml.Unmarshal(data, &tmpConfig)
 
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Could not load config.", err)
 	}
 
-	connDataloader = conn
+	config = tmpConfig
+	fmt.Println(config)
 
-	router := fasthttprouter.New()
-	router.GET("/", Index)
-	router.OPTIONS("/proto.:service/:method", OptionsProto)
-	router.POST("/proto.:service/:method", PostProto)
+	setupUpstreams(config)
 
-	log.Fatal(fasthttp.ListenAndServe(":8080", router.Handler))
+	for _, li := range config.Listeners {
+		log.Fatal(fasthttp.ListenAndServe(li.Address, handlerWithListener(&li)))
+	}
 }

@@ -1,0 +1,27 @@
+listeners:
+- name: http
+  address: :8080
+  virtualhosts:
+  - name: local
+    domain: ["*"]
+    routes:
+    - match:
+        prefix: /proto.Service1
+      upstream: upstream1
+    - match:
+        prefix: /proto.Service2
+      upstream: upstream2
+    - match:
+        prefix: /api
+      upstream: upstream3
+
+upstream:
+- name: upstream1
+  address: localhost:50051
+  type: grpc
+- name: upstream2
+  address: localhost:50055
+  type: grpc
+- name: upstream3
+  address: google.com
+  type: http
