@@ -186,7 +186,7 @@ func handlerWithListener(listener *internalConfig.Listener) func (ctx *fasthttp.
 
 func main() {
 
-	data, err := ioutil.ReadFile("config.yaml")
+	data, err := ioutil.ReadFile("/app/config.yaml")
 
 	if err != nil {
 		log.Fatal(err)
