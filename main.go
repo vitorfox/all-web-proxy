@@ -3,8 +3,10 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	grpc_auto "github.com/vitorfox/all-web-proxy/internal/grpc-auto"
 	"gopkg.in/yaml.v2"
 	"io/ioutil"
+	"time"
 
 	"google.golang.org/grpc/metadata"
 	"log"
@@ -18,7 +20,7 @@ import (
 
 var (
 	maxRecvSize = 1024 * 1024 * 1024
-	grpcUpstreamConnections = make(map[string]*grpc.ClientConn)
+	grpcUpstreamConnections = make(map[string]*grpc_auto.AutoGrpc)
 	config internalConfig.All
 )
 
@@ -52,8 +54,8 @@ func ProtoHandler(ctx *fasthttp.RequestCtx, upstream *internalConfig.Upstream) {
 	case "OPTIONS":
 		OptionsProto(ctx)
 	case "POST":
-		if conn, ok := grpcUpstreamConnections[upstream.Name]; ok {
-			PostProto(ctx, conn)
+		if auto, ok := grpcUpstreamConnections[upstream.Name]; ok {
+			PostProto(ctx, auto.GetConnection())
 		}
 	}
 }
@@ -136,12 +138,13 @@ func GenericHttp(ctx *fasthttp.RequestCtx, upstream *internalConfig.Upstream) {
 func setupUpstreams(config internalConfig.All) {
 	for _, up := range config.Upstream {
 		if up.Type == internalConfig.UPSTREAM_GRPC {
-			conn, err := grpc.Dial(up.Address, grpc.WithInsecure())
-			if err != nil {
-				log.Println(err)
-				continue
-			}
-			grpcUpstreamConnections[up.Name] = conn
+
+			auto := grpc_auto.NewAutoGrpc(
+				up.Address,
+				&grpc_auto.Config{Asynchronous: false, RetryInterval: time.Second},
+				grpc.WithInsecure(),
+				)
+			grpcUpstreamConnections[up.Name] = auto
 		}
 	}
 }
